@@ -134,7 +134,15 @@ async def chat(
             role_hint=role_hint,
         )
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Gemini error: {e}")
+        msg = str(e).lower()
+        is_quota = any(k in msg for k in ["429", "quota", "resource_exhausted", "rate limit"])
+        status_code = 429 if is_quota else 502
+        detail = (
+            "Kuota harian Gemini untuk API key ini habis. Silakan coba lagi besok "
+            "atau upgrade paket Gemini."
+            if is_quota else f"AI Tutor sedang sibuk: {e}"
+        )
+        raise HTTPException(status_code=status_code, detail=detail)
 
     # persist assistant
     asst = TutorMessage(session_id=session.id, role="assistant", content=reply_text)

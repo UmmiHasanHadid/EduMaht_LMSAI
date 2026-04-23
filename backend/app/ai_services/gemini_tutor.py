@@ -119,7 +119,11 @@ async def _send_with_retry(chat: LlmChat, message: UserMessage, retries: int = 3
         except Exception as e:
             last_err = e
             msg = str(e).lower()
+            # Treat 429 (quota) as non-retriable on THIS model — fallback handler will switch models.
+            is_quota = any(k in msg for k in ["429", "rate limit", "ratelimit", "quota", "resource_exhausted"])
             transient = any(k in msg for k in ["503", "unavailable", "overload", "high demand", "timeout"])
+            if is_quota:
+                raise
             if transient and attempt < retries:
                 await asyncio.sleep(1.2 * (attempt + 1))
                 continue
@@ -127,8 +131,20 @@ async def _send_with_retry(chat: LlmChat, message: UserMessage, retries: int = 3
     raise last_err  # pragma: no cover
 
 
+def _is_fallbackable_error(err: Exception) -> bool:
+    """Errors where trying a different model may succeed."""
+    msg = str(err).lower()
+    return any(
+        k in msg
+        for k in [
+            "503", "unavailable", "overload", "high demand", "timeout",
+            "429", "rate limit", "ratelimit", "quota", "resource_exhausted",
+        ]
+    )
+
+
 async def _send_with_fallback(session_uid: str, system: str, user_text: str) -> str:
-    """Try primary model, fall back to preview model on transient errors."""
+    """Try primary model, fall back to preview/pro on transient OR quota errors."""
     models = [settings.gemini_model, "gemini-3-flash-preview", "gemini-2.5-pro"]
     seen = set()
     ordered = []
@@ -148,7 +164,11 @@ async def _send_with_fallback(session_uid: str, system: str, user_text: str) -> 
             return await _send_with_retry(chat, UserMessage(text=user_text), retries=2)
         except Exception as e:
             last_err = e
-            continue
+            if _is_fallbackable_error(e):
+                # try next model
+                continue
+            # non-fallbackable error — abort
+            raise
     raise last_err if last_err else RuntimeError("Gemini unavailable")
 
 
@@ -194,21 +214,18 @@ async def ai_explain(
     context_block = _build_context_block(course_title, lesson_title, material)
     system = EXPLAIN_SYSTEM_PROMPT + context_block
 
-    chat = _make_chat(f"explain-{uuid.uuid4()}", system)
     prompt = (
         f"Tolong jelaskan topik berikut untuk tingkat '{level}': {topic}.\n"
         "Pastikan penjelasan lengkap, terstruktur, dan memotivasi."
     )
-    reply = await _send_with_retry(chat, UserMessage(text=prompt))
+    reply = await _send_with_fallback(f"explain-{uuid.uuid4()}", system, prompt)
     return reply.strip()
 
 
 async def ai_summarize(material: str, target_length: str = "ringkas") -> str:
     system = EXPLAIN_SYSTEM_PROMPT + "\nGaya ringkasan: " + target_length
-    chat = _make_chat(f"summary-{uuid.uuid4()}", system)
-    reply = await _send_with_retry(
-        chat, UserMessage(text=f"Ringkas materi berikut:\n\n{material}")
-    )
+    prompt = f"Ringkas materi berikut:\n\n{material}"
+    reply = await _send_with_fallback(f"summary-{uuid.uuid4()}", system, prompt)
     return reply.strip()
 
 
@@ -242,14 +259,13 @@ async def ai_generate_quiz(
     context_block = f"\nMateri referensi:\n{material[:4000]}" if material else ""
     system = QUIZ_SYSTEM_PROMPT + context_block
 
-    chat = _make_chat(f"quiz-{uuid.uuid4()}", system)
     prompt = (
         f"Buat {num_questions} soal dengan tingkat kesulitan '{difficulty}' "
         f"tentang topik: {topic}.\n"
         f"Gunakan tipe soal dari: {', '.join(types)}.\n"
         "Balas HANYA JSON sesuai skema."
     )
-    raw = await _send_with_retry(chat, UserMessage(text=prompt))
+    raw = await _send_with_fallback(f"quiz-{uuid.uuid4()}", system, prompt)
     data = _extract_json(raw)
     # basic normalization
     for idx, q in enumerate(data.get("questions", []), start=1):
@@ -270,12 +286,11 @@ async def ai_feedback_on_answer(
         "Awali dengan apresiasi usaha, jelaskan bagian yang benar dan yang perlu diperbaiki, "
         "lalu berikan dorongan positif. Maksimal 4 kalimat."
     )
-    chat = _make_chat(f"fb-{uuid.uuid4()}", system)
     prompt = (
         f"Pertanyaan: {question}\n"
         f"Jawaban siswa: {student_answer}\n"
         f"Jawaban ideal: {correct_answer}\n\n"
         "Berikan feedback singkat yang memotivasi."
     )
-    reply = await _send_with_retry(chat, UserMessage(text=prompt))
+    reply = await _send_with_fallback(f"fb-{uuid.uuid4()}", system, prompt)
     return reply.strip()
