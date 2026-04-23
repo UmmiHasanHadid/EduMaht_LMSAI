@@ -1,0 +1,43 @@
+{
+  "summary": "Backend-only pytest of EduMaht LMS AI: 31/33 passing. All auth, AI Tutor chat/sessions/download/delete/explain/summarize/retention-notice, and all Quiz CRUD/attempts/export/role-gating flows passed end-to-end. The 2 failing tests are quiz.generate endpoints that hit Gemini free-tier daily quota (429 RESOURCE_EXHAUSTED, 20 req/day limit on gemini-2.5-flash). The endpoint logic itself is correct (verified by chat/explain/summarize which use the exact same Gemini pipeline and all succeeded earlier in the run).",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {
+        "endpoint": "POST /api/quizzes/generate",
+        "issue": "Returns 502 'Gagal generate quiz: litellm.RateLimitError ... code:429 RESOURCE_EXHAUSTED, limit:20/day gemini-2.5-flash' once the daily quota is exhausted. The fallback logic in gemini_tutor._send_with_fallback only treats 503/unavailable/overload/timeout as transient; it does NOT catch 429 RateLimitError, so the declared fallback models (gemini-3-flash-preview, gemini-2.5-pro) never get tried on quota errors. Recommend: extend _send_with_retry/_send_with_fallback transient detection to also include '429', 'rate limit', 'quota', 'resource_exhausted' so fallback models can absorb per-model daily quota, AND surface a friendlier 429 to clients instead of generic 502."
+      }
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Improve Gemini fallback: in /app/backend/app/ai_services/gemini_tutor.py add 429/RateLimit/RESOURCE_EXHAUSTED to the transient-error list in _send_with_retry (or catch in _send_with_fallback) so fallback to gemini-3-flash-preview / gemini-2.5-pro actually triggers when free-tier quota is hit on the primary model.",
+    "Consider mapping upstream 429 to HTTP 429 (with Retry-After) instead of 502 Gemini error for better UX.",
+    "Document in README/ops notes: user-supplied Gemini key is free-tier (20 req/day per model). Either upgrade billing plan or rely on fallback model spread to stay usable during heavy testing."
+  ],
+  "critical_code_review_comments": [
+    "gemini_tutor.py fallback ordering is good but transient-error detection misses 429/RateLimitError — fallback to gemini-3-flash-preview / gemini-2.5-pro never fires on quota exhaustion (root cause of the 2 test failures).",
+    "quizzes.py _serialize_quiz correctly hides correct_answer/explanation from students (verified). Good separation of source='system' vs 'teacher'.",
+    "ai_tutor.py correctly enforces owner-only access on sessions/messages/download/delete (teacher returns 403 'Hanya pemilik sesi' — verified).",
+    "_cleanup_expired runs on every chat/list call and uses UTC cutoff — OK, simple and idempotent.",
+    "server.py _seed_demo_users is idempotent via email lookup — good.",
+    "Minor: chat endpoint persists user_msg before AI call; if Gemini call fails, the user message stays in DB without an assistant reply. Consider either wrapping in a transaction rolled back on failure or tagging orphaned user messages.",
+    "Minor: ACCESS_TOKEN_EXPIRE_MINUTES=1440 (24h) + refresh 30d is fine; SECRET_KEY is committed in backend/.env — reminder to rotate before production deploy.",
+    "Minor: CORS allow_origins='*' with allow_credentials=True is semantically disallowed by spec (browsers ignore credentials); tighten in prod."
+  ],
+  "updated_files": [
+    "/app/backend/tests/__init__.py",
+    "/app/backend/tests/backend_test.py"
+  ],
+  "success_rate": {"backend": "94% (31/33)", "frontend": "not tested"},
+  "test_credentials": "siswa@edumaht.com/Siswa1234, guru@edumaht.com/Guru1234, admin@edumaht.com/Admin1234 (all verified working). New student registered during test: TEST_<hex>@edumaht.com/TestPass123 (seeded by test; left in DB).",
+  "seed_data_creation": "One TEST_* student auto-registered per run, and one TEST_AI quiz + one TEST_Manual quiz created then deleted in test_delete_quiz_teacher_ok (cleanup passes).",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Gemini key is free-tier (20 req/day per model on gemini-2.5-flash). Running the full suite once consumes most of the quota; subsequent runs in the same 24h window will see 429 on late AI calls (chat/explain/summarize/quiz-generate). If you need to re-run AI tests, either wait for the daily window to reset, or once main agent extends fallback to catch 429 the tests should stay green because gemini-3-flash-preview / gemini-2.5-pro have separate per-model quotas.",
+  "rca_of_the_issue": "Root cause of the 2 failures: Gemini free-tier per-model-per-day quota (20 requests/day) on gemini-2.5-flash was exhausted earlier in the same test run by the chat/explain/summarize AI-Tutor tests. When quiz-generate calls fired at the tail of the run, Gemini returned 429 RESOURCE_EXHAUSTED. The backend's _send_with_retry considers only '503/unavailable/overload/timeout' as transient and re-raises on 429, so _send_with_fallback propagates the exception without ever trying gemini-3-flash-preview or gemini-2.5-pro. FastAPI handler wraps it into HTTPException(502, 'Gagal generate quiz: ...'). Reproduction: run the full pytest twice in quick succession, or run >20 AI-backed calls against gemini-2.5-flash in 24h. Mitigation: (a) add 429/RateLimit/RESOURCE_EXHAUSTED/quota to transient keywords so fallback models kick in, (b) upgrade Gemini plan, or (c) cache/rate-limit AI generate calls at backend."
+}
